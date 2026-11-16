@@ -1,0 +1,121 @@
+---
+title: "03_figures"
+format: html
+editor: visual
+---
+
+# Figure for the thesis
+
+Figure 1 (Section 5.5): association between a typical within-country change in each variable and per capita CO₂ emissions, for transport and buildings. The caption and note are written in Word; the image has no title or caption.
+
+Saved as 600 dpi PNG in `output/figures/`.
+
+BLOCK 1 — Setup
+
+```{r}
+#| label: setup-figures
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(plm)
+library(sandwich)
+
+df <- read_csv(here("data", "clean", "cleaned_wdi_panel.csv"))
+dir.create(here("output", "figures"), recursive = TRUE, showWarnings = FALSE)
+
+x_main <- c("urb_rate", "population_largest_city_pct_urb", "pop_over_1M_pct_urb",
+            "ln_cons", "ln_density")
+```
+
+BLOCK 2 — Effect sizes: coefficient × typical within-country change
+
+```{r}
+#| label: effect-sizes
+#| message: false
+
+pdata <- pdata.frame(df, index = c("country_code", "year"))
+
+vc_cl <- function(m) vcovHC(m, method = "arellano", type = "HC1", cluster = "group")
+fe_tw <- function(y) plm(reformulate(x_main, response = y), pdata,
+                         model = "within", effect = "twoways")   # same model as Table 3
+
+# Typical within-country change = standard deviation of each regressor AFTER the same
+# transformation as the two-way FE model: remove the country mean AND the year mean
+# (exact because the panel is balanced). Removing only the country mean would keep trends
+# common to all countries, which the two-way FE model does not use, and would overstate
+# the typical change (Mummolo & Peterson, 2018). Same values as "SD within (two-way)" in Table 2.
+two_way_demean <- function(x, country, year) {
+  x - ave(x, country) - ave(x, year) + mean(x)   # x - country mean - year mean + grand mean
+}
+
+sd_within <- map_dbl(set_names(x_main),
+                     ~ sd(two_way_demean(df[[.x]], df$country_code, df$year)))
+sd_within   # check against Table 2
+
+outcomes <- c("Transport" = "ln_co2_transport_pc",
+              "Buildings" = "ln_co2_building_pc")
+
+effects <- imap_dfr(outcomes, function(y, nm) {
+  m <- fe_tw(y); V <- vc_cl(m)
+  tibble(outcome = nm, variable = names(coef(m)), b = coef(m), se = sqrt(diag(V)))
+}) %>%
+  mutate(sdw   = sd_within[variable],
+         eff   = 100 * b * sdw,
+         lo    = 100 * (b - 1.96 * se) * sdw,       # 95% CI (thin bar)
+         hi    = 100 * (b + 1.96 * se) * sdw,
+         lo90  = 100 * (b - 1.645 * se) * sdw,      # 90% CI (thick bar)
+         hi90  = 100 * (b + 1.645 * se) * sdw,
+         # Thesis notation, top-to-bottom order: PRIM, LAS, URB | ln CONS, ln DENS
+         var   = factor(variable, levels = rev(c("population_largest_city_pct_urb", "pop_over_1M_pct_urb",
+                                                 "urb_rate", "ln_cons", "ln_density"))),
+         group = factor(ifelse(variable %in% c("ln_cons", "ln_density"), "Controls", "Urban structure"),
+                        levels = c("Urban structure", "Controls")),
+         outcome = factor(outcome, levels = names(outcomes)))
+
+# Values quoted in Section 5.5 (effect in % and 95% CI)
+effects %>% select(outcome, variable, eff, lo, hi) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+```
+
+BLOCK 3 — Figure 1
+
+```{r}
+#| label: figure1-effect-sizes
+
+# Academic style: black and grey, serif font, thesis notation for labels.
+# Thick bar = 90% CI, thin bar = 95% CI; dashed line at zero.
+lab_expr <- c(population_largest_city_pct_urb = "PRIM",
+              pop_over_1M_pct_urb             = "LAS^u",
+              urb_rate                        = "URB",
+              ln_cons                         = "ln~CONS",
+              ln_density                      = "ln~DENS")
+
+theme_academic <- function(base_size = 10) {
+  theme_bw(base_size = base_size, base_family = "serif") +
+    theme(panel.grid.minor   = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_line(colour = "grey90", linewidth = 0.25),
+          panel.border       = element_rect(colour = "grey30", linewidth = 0.4),
+          strip.background   = element_rect(fill = "white", colour = "grey30", linewidth = 0.4),
+          strip.text         = element_text(colour = "black", size = base_size),
+          axis.text          = element_text(colour = "black"),
+          axis.ticks         = element_line(colour = "grey30", linewidth = 0.3),
+          legend.position    = "none")
+}
+
+fig1 <- ggplot(effects, aes(eff, var)) +
+  geom_vline(xintercept = 0, colour = "grey40", linewidth = 0.35, linetype = "dashed") +
+  geom_linerange(aes(xmin = lo,   xmax = hi),   colour = "grey45", linewidth = 0.45) +   # 95% CI
+  geom_linerange(aes(xmin = lo90, xmax = hi90), colour = "black",  linewidth = 1.1) +    # 90% CI
+  geom_point(colour = "black", size = 1.9) +
+  facet_grid(group ~ outcome, scales = "free_y", space = "free_y") +
+  scale_y_discrete(labels = function(x) parse(text = lab_expr[x])) +
+  labs(x = expression("Change in per capita CO"[2]*" emissions (%)"), y = NULL) +
+  theme_academic()
+
+fig1
+ggsave(here("output", "figures", "Figure1_effect_sizes.png"), fig1,
+       width = 16, height = 8.5, units = "cm", dpi = 600, bg = "white")
+```

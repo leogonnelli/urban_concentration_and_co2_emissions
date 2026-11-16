@@ -1,0 +1,186 @@
+---
+title: "01_data_cleaning"
+format: html
+editor: visual
+---
+
+# Data Engineering and Cleaning
+
+Source: World Bank, World Development Indicators (WDI), database version of 13 July 2026 (downloads of 10 September and 6 October 2026). Sample: 35 OECD countries, 2000–2019 (thesis, Section 3).
+
+BLOCK 1 — Setup and import
+
+```{r}
+#| label: setup-and-import
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(here)
+
+# All WDI exports in data/raw/ are stacked: every file has the same layout
+# (one row per country x series, one column per year), so new downloads
+# just need to be saved in that folder as "raw_data_wdi*.csv".
+# - All columns read as text so files with different year ranges stack cleanly
+# - ".." is WDI's code for missing values
+raw_files <- list.files(here("data", "raw"), pattern = "^raw_data_wdi.*\\.csv$",
+                        full.names = TRUE)
+raw_files   # check that all your downloads are listed
+
+df_raw <- raw_files %>%
+  map(~ read_csv(.x, col_types = cols(.default = col_character()),
+                 na = c("", "NA", ".."))) %>%
+  bind_rows() %>%
+  distinct(`Country Code`, `Series Code`, .keep_all = TRUE)  # if a series was downloaded twice
+
+glimpse(df_raw)
+```
+
+BLOCK 2 — Keep the series used in the thesis, reshape and rename
+
+```{r}
+#| label: data-cleaning
+#| message: false
+#| warning: false
+
+# WDI series used in the thesis (World Bank, 2026a-i in the reference list)
+series_names <- c(
+  "EN.GHG.CO2.TR.MT.CE.AR5" = "co2_transport",                      # Mt CO2e (2026a)
+  "EN.GHG.CO2.BU.MT.CE.AR5" = "co2_building",                       # Mt CO2e (2026b)
+  "EN.URB.LCTY.UR.ZS"       = "population_largest_city_pct_urb",    # PRIM, % of URBAN pop (2026c)
+  "EN.URB.MCTY.TL.ZS"       = "urban_population_over_1M",           # LAS^t, % of TOTAL pop (2026d)
+  "SP.URB.TOTL.IN.ZS"       = "urb_rate",                           # URB, % of total pop (2026e)
+  "EN.POP.DNST"             = "pop_density",                        # people per km2 of land (2026f)
+  "NE.CON.PRVT.PC.KD"       = "household_consumption_pc_real_2015", # constant 2015 USD (2026g)
+  "EN.GHG.CO2.IC.MT.CE.AR5" = "co2_industry",                       # Mt CO2e, placebo (2026h)
+  "SP.POP.TOTL"             = "pop_total"                           # (2026i)
+)
+
+df_clean <- df_raw %>%
+  select(`Country Code`, `Country Name`, `Series Code`, contains("[YR")) %>%
+  filter(!is.na(`Country Code`), `Series Code` %in% names(series_names)) %>%  # also drops WDI footer rows
+  rename(country_code = `Country Code`,
+         country_name = `Country Name`,
+         series_code  = `Series Code`) %>%
+  pivot_longer(cols = contains("[YR"), names_to = "year", values_to = "value") %>%
+  mutate(year        = as.numeric(str_extract(year, "^\\d{4}")),
+         value       = as.numeric(value),
+         series_code = unname(series_names[series_code])) %>%
+  pivot_wider(names_from = series_code, values_from = value)
+
+glimpse(df_clean)
+```
+
+BLOCK 3 — Sample restriction (OECD, 2000–2019)
+
+```{r}
+#| label: sample-restriction
+
+# 38 OECD member countries (ISO3)
+oecd <- c("AUS","AUT","BEL","CAN","CHL","COL","CRI","CZE","DNK","EST","FIN","FRA",
+          "DEU","GRC","HUN","ISL","IRL","ISR","ITA","JPN","KOR","LVA","LTU","LUX",
+          "MEX","NLD","NZL","NOR","POL","PRT","SVK","SVN","ESP","SWE","CHE","TUR",
+          "GBR","USA")
+
+# Dropped: no data for primacy (population_largest_city_pct_urb) in the WDI
+dropped <- c("ISL", "LUX", "SVN")
+
+df_sample <- df_clean %>%
+  filter(country_code %in% oecd,
+         !country_code %in% dropped,
+         year >= 2000, year <= 2019)
+# Why 2000: before 2000, consumption is missing for EST, HUN, LTU, LVA, POL, SVK and
+# density for CZE, EST, LTU, LVA, SVK and BEL -> starting in 2000 gives a balanced panel
+# without the transition years of the former Eastern-bloc economies.
+# Why 2019: last pre-COVID year (2020 lockdowns cut transport emissions sharply and
+# temporarily, which has nothing to do with urban structure).
+
+n_distinct(df_sample$country_code)   # expected: 35
+```
+
+BLOCK 4 — The "\>1M agglomerations" variable: missing values
+
+In WDI, `urban_population_over_1M` (LAS\^t) is missing when a country has no agglomeration above 1 million inhabitants (EST, LTU, LVA, SVK), so NA means 0 %. The set of agglomerations is fixed (cities above 1 million in 2018), so no country can cross the threshold during the sample period; the check below confirms it.
+
+```{r}
+#| label: over-1M-diagnostics
+
+over1M_check <- df_sample %>%
+  group_by(country_code, country_name) %>%
+  summarise(n_missing = sum(is.na(urban_population_over_1M)),
+            .groups = "drop") %>%
+  mutate(status = case_when(
+    n_missing == 0  ~ "always observed",
+    n_missing == 20 ~ "never a 1M+ city (set to 0)",
+    TRUE            ~ "crosses 1M threshold during sample"
+  ))
+
+over1M_check %>% filter(status != "always observed")   # expected: EST, LTU, LVA, SVK, all "set to 0"
+```
+
+BLOCK 5 — Feature engineering
+
+```{r}
+#| label: feature-engineering
+
+df_features <- df_sample %>%
+  mutate(
+    urban_population_over_1M = replace_na(urban_population_over_1M, 0),
+
+    # LAS^u = LAS^t / URB * 100: same denominator as PRIM (share of URBAN population)
+    pop_over_1M_pct_urb = urban_population_over_1M / urb_rate * 100,
+
+    # Per-capita emissions in tonnes CO2 (Mt * 1e6 / persons)
+    co2_transport_pc = co2_transport * 1e6 / pop_total,
+    co2_building_pc  = co2_building  * 1e6 / pop_total,
+    co2_industry_pc  = co2_industry  * 1e6 / pop_total,
+
+    # Logs: all values are strictly positive, so no "+1"
+    # -> level regressors give semi-elasticities (100*beta = % change in Y per unit of X),
+    #    log regressors give elasticities (thesis, Section 4.1)
+    ln_co2_transport_pc = log(co2_transport_pc),
+    ln_co2_building_pc  = log(co2_building_pc),
+    ln_co2_industry_pc  = log(co2_industry_pc),
+    ln_cons             = log(household_consumption_pc_real_2015),
+    ln_density          = log(pop_density)
+  )
+
+summary(select(df_features, co2_transport_pc, co2_building_pc, co2_industry_pc, urb_rate,
+               population_largest_city_pct_urb, urban_population_over_1M,
+               pop_over_1M_pct_urb, household_consumption_pc_real_2015, pop_density))
+
+# Zero emissions would give log(0) = -Inf: list any such cases (expected: none)
+df_features %>%
+  filter(if_any(starts_with("ln_"), ~ is.infinite(.x))) %>%
+  select(country_code, year, starts_with("ln_"))
+```
+
+BLOCK 6 — Missing values and balance check
+
+```{r}
+#| label: handle-nas
+
+key_vars <- c("co2_transport_pc", "co2_building_pc", "pop_total", "urb_rate",
+              "population_largest_city_pct_urb", "household_consumption_pc_real_2015",
+              "pop_density")
+
+# Report remaining NAs BEFORE dropping, so nothing disappears silently
+df_features %>%
+  filter(if_any(all_of(key_vars), is.na)) %>%
+  select(country_code, year, all_of(key_vars))
+
+df_final <- df_features %>% drop_na(all_of(key_vars))
+
+# Balanced panel check: every country should have 20 years
+df_final %>% count(country_code) %>% count(n, name = "n_countries")
+stopifnot(n_distinct(df_final$country_code) == 35, nrow(df_final) == 700)
+```
+
+BLOCK 7 — Export
+
+```{r}
+#| label: export-clean-data
+
+dir.create(here("data", "clean"), recursive = TRUE, showWarnings = FALSE)
+write_csv(df_final, here("data", "clean", "cleaned_wdi_panel.csv"))
+```

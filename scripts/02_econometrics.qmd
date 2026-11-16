@@ -1,0 +1,634 @@
+---
+title: "02_econometrics"
+format: html
+editor: visual
+---
+
+# Econometrics
+
+Strategy (thesis, Chapters 4–5): (1) descriptives and within/between variance (Table 2), (2) pooled OLS, RE, one-way FE, two-way FE and Mundlak / correlated random effects (Table 3, Appendix A1–A2), (3) classical Hausman and robust Mundlak tests, Wooldridge and Pesaran CD diagnostics (Table 4), (4) within vs between associations (Table 5), (5) robustness checks and industry placebo (Appendix A3–A4).
+
+All inference uses standard errors clustered by country (Arellano, 1987), robust to heteroskedasticity and serial correlation. Driscoll–Kraay SEs (also robust to cross-sectional dependence) are used as a robustness check.
+
+Interpretation: outcomes are in logs and urban regressors in percentage points, so 100 × β = % change in per-capita emissions for a one-percentage-point increase. The coefficients on `ln_cons` and `ln_density` are elasticities.
+
+Table 1 (literature overview) is made directly in Word; Figure 1 is produced in `03_figures.qmd`.
+
+BLOCK 1 — Setup
+
+```{r}
+#| label: setup-econometrics
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(plm)        # panel models, Hausman, Wooldridge, Pesaran CD, Driscoll-Kraay (vcovSCC)
+library(lmtest)     # coeftest()
+library(sandwich)   # cluster-robust variance
+library(car)        # linearHypothesis() for the robust Mundlak test
+library(flextable)  # thesis tables (booktabs style)
+library(officer)    # line styles for flextable
+
+df_model <- read_csv(here("data", "clean", "cleaned_wdi_panel.csv"))
+```
+
+BLOCK 2 — Variables, Mundlak means, lags, panel index
+
+```{r}
+#| label: panel-and-mundlak
+#| message: false
+
+# Main regressors: URB, PRIM, LAS^u, ln CONS, ln DENS
+x_main <- c("urb_rate", "population_largest_city_pct_urb", "pop_over_1M_pct_urb", "ln_cons", "ln_density")
+
+# Robustness: original WDI measure of 1M+ agglomerations (LAS^t, % of TOTAL population)
+x_alt  <- c("urb_rate", "population_largest_city_pct_urb", "urban_population_over_1M", "ln_cons", "ln_density")
+
+# Robustness: urban-structure variables lagged (t-1); consumption and density stay contemporaneous
+x_lag  <- c("lag_urb_rate", "lag_population_largest_city_pct_urb", "lag_pop_over_1M_pct_urb", "ln_cons", "ln_density")
+
+df_m <- df_model %>%
+  arrange(country_code, year) %>%
+  group_by(country_code) %>%
+  mutate(
+    # Mundlak: country means of the EXACT regressors (mean of the log, not log of the mean)
+    across(all_of(x_main), mean, .names = "m_{.col}"),
+    across(c(urb_rate, population_largest_city_pct_urb, pop_over_1M_pct_urb),
+           ~ dplyr::lag(.x), .names = "lag_{.col}")
+  ) %>%
+  ungroup()
+
+pdata <- pdata.frame(df_m, index = c("country_code", "year"))
+```
+
+BLOCK 3 — Countries with suspicious jumps in the urbanization rate (thesis, Section 3.4)
+
+A jump of many points in a few years in an OECD country usually reflects a change in the national definition of "urban", not real urbanization. The countries identified here are excluded in robustness column (5) of Table A3.
+
+```{r}
+#| label: urb-rate-jumps
+
+df_m %>%
+  group_by(country_code, country_name) %>%
+  summarise(change_2000_2019 = last(urb_rate) - first(urb_rate),
+            max_yearly_jump  = max(abs(diff(urb_rate))),
+            .groups = "drop") %>%
+  arrange(desc(change_2000_2019)) %>%
+  head(8)
+
+reclass_countries <- c("TUR", "JPN", "NLD", "CRI")
+pdata_noreclass <- pdata.frame(filter(df_m, !country_code %in% reclass_countries),
+                               index = c("country_code", "year"))
+```
+
+BLOCK 4 — Primacy and country size (thesis, Section 6.3)
+
+```{r}
+#| label: primacy-country-size
+
+# Average primacy and average population by country, 2000-2019
+prim_pays <- df_m %>%
+  group_by(country_code) %>%
+  summarise(prim    = mean(population_largest_city_pct_urb),
+            pop_mio = mean(pop_total) / 1e6) %>%
+  arrange(desc(prim))
+
+print(prim_pays, n = 35)
+
+# Cross-country correlation between country size (log population) and primacy
+cor(log(prim_pays$pop_mio), prim_pays$prim)
+```
+
+BLOCK 5 — Descriptive statistics and within/between variance decomposition (Table 2)
+
+```{r}
+#| label: descriptives
+
+vars_desc <- c("co2_transport_pc", "co2_building_pc", x_main)
+
+# sd_within    : deviations from the country mean (one-way, descriptive)
+# sd_within_tw : deviations from country AND year means (two-way demeaning, exact because
+#                the panel is balanced). This is the variation the two-way FE model uses,
+#                so it is the "typical within change" used for effect sizes (Figure 1).
+decomp <- df_m %>%
+  select(country_code, year, all_of(vars_desc)) %>%
+  pivot_longer(-c(country_code, year), names_to = "variable") %>%
+  group_by(variable) %>%
+  mutate(grand_mean = mean(value)) %>%
+  group_by(variable, country_code) %>%
+  mutate(country_mean = mean(value), within_dev = value - country_mean) %>%
+  group_by(variable, year) %>%
+  mutate(year_mean = mean(value),
+         within_dev_tw = value - country_mean - year_mean + grand_mean) %>%
+  group_by(variable) %>%
+  summarise(
+    mean         = mean(value),
+    sd_overall   = sd(value),
+    sd_between   = sd(tapply(value, country_code, mean)),
+    sd_within    = sd(within_dev),
+    sd_within_tw = sd(within_dev_tw),
+    min          = min(value),
+    max          = max(value),
+    share_within = sd_within^2 / sd_overall^2
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+decomp
+
+# Extremes of per capita emissions quoted in Section 5.1
+df_m %>%
+  select(country_code, year, co2_transport_pc, co2_building_pc) %>%
+  pivot_longer(-c(country_code, year)) %>%
+  group_by(name) %>%
+  filter(value %in% range(value))
+```
+
+BLOCK 6 — Models
+
+```{r}
+#| label: models
+
+make_f <- function(y, x, extra = NULL) reformulate(c(x, extra), response = y)
+
+# Cluster-robust (by country) variance matrix
+vc_cl <- function(m) vcovHC(m, method = "arellano", type = "HC1", cluster = "group")
+
+# Main model sequence for one outcome (Section 4.2)
+fit_main <- function(y, x = x_main, data = pdata) {
+  list(
+    "Pooled OLS"        = plm(make_f(y, x), data, model = "pooling"),   # no country, no year effects
+    "RE"                = plm(make_f(y, x, "factor(year)"), data, model = "random"),
+    "FE (country)"      = plm(make_f(y, x), data, model = "within", effect = "individual"),
+    "FE (country+year)" = plm(make_f(y, x), data, model = "within", effect = "twoways"),
+    "Mundlak / CRE"     = plm(make_f(y, x, c(paste0("m_", x), "factor(year)")), data, model = "random")
+  )
+}
+
+fe_tw <- function(y, x = x_main, data = pdata) plm(make_f(y, x), data, model = "within", effect = "twoways")
+
+m_tr <- fit_main("ln_co2_transport_pc")
+m_bu <- fit_main("ln_co2_building_pc")
+```
+
+BLOCK 7 — Specification and diagnostic tests (Table 4)
+
+```{r}
+#| label: tests
+
+# (a) Classical Hausman (assumes homoskedastic, non-autocorrelated errors)
+haus <- function(m) phtest(m[["FE (country+year)"]], m[["RE"]])
+
+# (b) Robust Hausman = Mundlak Wald test with clustered SEs: H0 = all country means jointly zero
+mundlak_test <- function(m) {
+  means <- grep("^m_", names(coef(m)), value = TRUE)
+  linearHypothesis(m, paste(means, "= 0"), vcov. = vc_cl(m), test = "Chisq")
+}
+
+# (c) Wooldridge serial correlation (one-way FE) and Pesaran CD (two-way FE)
+diag_tests <- function(y) {
+  fe1 <- plm(make_f(y, x_main), pdata, model = "within", effect = "individual")
+  list(wool = pwartest(fe1),
+       pes  = pcdtest(fe_tw(y), test = "cd"))
+}
+
+h_tr <- haus(m_tr); h_bu <- haus(m_bu)
+w_tr <- mundlak_test(m_tr[["Mundlak / CRE"]]); w_bu <- mundlak_test(m_bu[["Mundlak / CRE"]])
+d_tr <- diag_tests("ln_co2_transport_pc"); d_bu <- diag_tests("ln_co2_building_pc")
+
+# Degrees of freedom of the Hausman test (check: should be 5)
+cat("Hausman df:", h_tr$parameter, "(transport),", h_bu$parameter, "(buildings)\n")
+
+# Sanity check: Mundlak within coefficients must equal the two-way FE estimates
+for (m in list(m_tr, m_bu)) {
+  print(round(cbind(FE_twoways = coef(m[["FE (country+year)"]])[x_main],
+                    Mundlak    = coef(m[["Mundlak / CRE"]])[x_main]), 5))
+}
+```
+
+BLOCK 8 — Robustness checks, placebo and long differences (Appendix A3–A4)
+
+Long differences: urban structure changes slowly and the yearly series are partly interpolated, so only the change over the whole period is used: one observation per country, Δy = α + Δx'β + ε, with start and end values as 3-year averages (2000–02, 2017–19). The constant captures the common trend (the equivalent of year effects). N = 35, HC1 robust SEs, results read as indicative.
+
+```{r}
+#| label: robustness
+
+# Table A3, columns (1)-(5)
+robust_models <- function(y) {
+  base <- fe_tw(y)
+  list(
+    "Baseline"                 = base,
+    "Driscoll-Kraay SE"        = base,
+    "Urban vars lagged (t-1)"  = fe_tw(y, x_lag),
+    "LAS as % of total pop."   = fe_tw(y, x_alt),
+    "Excl. TUR, JPN, NLD, CRI" = fe_tw(y, x_main, pdata_noreclass)
+  )
+}
+
+robust_vcov <- function(ms) {
+  v <- map(ms, vc_cl)
+  v[["Driscoll-Kraay SE"]] <- vcovSCC(ms[["Driscoll-Kraay SE"]], maxlag = 2)   # m(T) = floor(4(T/100)^(2/9)) = 2
+  v
+}
+
+r_tr <- robust_models("ln_co2_transport_pc")
+r_bu <- robust_models("ln_co2_building_pc")
+
+# Table A3, column (6): long differences
+sector_y <- c("Transport" = "ln_co2_transport_pc", "Buildings" = "ln_co2_building_pc")
+ld_vars  <- c(unname(sector_y), x_main)
+
+df_ld <- df_m %>%
+  mutate(period = case_when(year <= 2002 ~ "start", year >= 2017 ~ "end")) %>%
+  filter(!is.na(period)) %>%
+  group_by(country_code, period) %>%
+  summarise(across(all_of(ld_vars), mean), .groups = "drop") %>%
+  pivot_longer(all_of(ld_vars), names_to = "variable") %>%
+  pivot_wider(names_from = period, values_from = value) %>%
+  mutate(d = end - start) %>%
+  select(country_code, variable, d) %>%
+  pivot_wider(names_from = variable, values_from = d, names_prefix = "d_")
+
+m_ld <- map(set_names(paste0("d_", sector_y), names(sector_y)),
+            ~ lm(reformulate(paste0("d_", x_main), response = .x), data = df_ld))
+
+# Table A4: industry placebo (same two-way FE specification)
+m_plac <- list(c1 = fe_tw("ln_co2_transport_pc"),
+               c2 = fe_tw("ln_co2_building_pc"),
+               c3 = fe_tw("ln_co2_industry_pc"))
+```
+
+BLOCK 9 — Thesis tables (academic "booktabs" layout)
+
+Only three horizontal rules (thick top, thin under the header, thick bottom), no vertical lines, Times New Roman, compact line spacing. Numbering follows the thesis:
+
+| Table | Content | Where |
+|----|----|----|
+| Table 1 | Overview of the reviewed empirical literature (made in Word) | 2.3 |
+| Table 2 | Descriptive statistics and decomposition of variance | 5.1 |
+| Table 3 | Two-way FE, transport and buildings, with Hausman and Mundlak tests | 5.2 |
+| Table 4 | Specification and diagnostic tests | 5.3 |
+| Table 5 | Within vs between vs gap (Mundlak), both sectors | 5.4 |
+| Table A1 | Transport, all estimators | Appendix |
+| Table A2 | Buildings, all estimators | Appendix |
+| Table A3 | Robustness checks | Appendix, cited in 4.5 and 5.6 |
+| Table A4 | Industry placebo | Appendix, cited in 4.5 and 5.6 |
+
+Each table is saved as its own .docx in `output/tables/thesis/`: open it, copy the table, paste into the thesis with "Keep source formatting".
+
+```{r}
+#| label: thesis-tables
+#| message: false
+
+dir.create(here("output", "tables"), recursive = TRUE, showWarnings = FALSE)
+out_thesis <- function(f) here("output", "tables", f)
+unlink(list.files(here("output", "tables"), full.names = TRUE))  # remove old exports
+
+## ---------- 1. Labels and formatting helpers ----------
+
+labels <- c(
+  "urb_rate"                            = "Urbanization rate (%)",
+  "population_largest_city_pct_urb"     = "Primacy, PRIM (% of urban pop.)",
+  "pop_over_1M_pct_urb"                 = "Large-agglomeration share, LAS (% of urban pop.)",
+  "ln_cons"                             = "ln household consumption p.c.",
+  "ln_density"                          = "ln population density",
+  "m_urb_rate"                          = "Mean: urbanization rate",
+  "m_population_largest_city_pct_urb"   = "Mean: PRIM",
+  "m_pop_over_1M_pct_urb"               = "Mean: LAS",
+  "m_ln_cons"                           = "Mean: ln consumption",
+  "m_ln_density"                        = "Mean: ln density"
+)
+lab3 <- c(urb  = "Urbanization rate (%)",
+          prim = "Primacy, PRIM (% of urban pop.)",
+          m1   = "Large-agglomeration share, LAS (% of urban pop.)")
+
+# Numbers with 3 decimals and a real minus sign
+fmt_num <- function(x, d = 3) str_replace(formatC(x, format = "f", digits = d), "^-", "−")
+fmt_p   <- function(p) ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+star_of <- function(p) case_when(p < .01 ~ "***", p < .05 ~ "**", p < .1 ~ "*", TRUE ~ "")
+r2_of   <- function(m) if (inherits(m, "plm")) summary(m)$r.squared[["rsq"]] else summary(m)$r.squared
+fmt_chi <- function(stat, p) paste0(formatC(stat, format = "f", digits = 1), star_of(p))
+fmt_test <- function(stat, p, d = 1) sprintf("%s (p %s)", fmt_num(stat, d),
+                                              ifelse(p < 0.001, "< 0.001", paste("=", fmt_p(p))))
+
+STARS_NOTE <- "* p < 0.1, ** p < 0.05, *** p < 0.01."
+
+# Regression block: two lines per variable (coefficient + stars, SE in parentheses).
+#   models  : named list of models (names = internal column names)
+#   vcovs   : list of variance matrices, same order
+#   rows    : row keys; row_labels: named vector key -> printed label
+#   term_map: optional list (one per model) mapping row key -> coefficient name,
+#             needed when columns use different variables (lags, alt. measure, long differences)
+reg_block <- function(models, vcovs, rows, row_labels, term_map = NULL) {
+  if (is.null(term_map)) term_map <- rep(list(setNames(rows, rows)), length(models))
+  ct <- map2(models, vcovs, ~ coeftest(.x, vcov. = .y))
+  cell <- function(j, key, what) {
+    t <- unname(term_map[[j]][key]); x <- ct[[j]]
+    if (is.na(t) || !t %in% rownames(x)) return("")
+    if (what == "est") paste0(fmt_num(x[t, 1]), star_of(x[t, 4])) else paste0("(", fmt_num(x[t, 2]), ")")
+  }
+  map_dfr(rows, function(k) {
+    est <- map_chr(seq_along(models), ~ cell(.x, k, "est"))
+    se  <- map_chr(seq_along(models), ~ cell(.x, k, "se"))
+    vals <- map(seq_along(models), ~ c(est[.x], se[.x])) |> set_names(names(models))
+    tibble(Variable = c(unname(row_labels[k]), ""), !!!vals)
+  })
+}
+
+# One extra line (e.g. "Observations") in a table with columns `cols`
+stat_row <- function(label, values, cols) {
+  as_tibble(as.list(setNames(c(label, as.character(values)), c("Variable", cols))))
+}
+
+# Empty line used as a panel title ("Panel A: Transport")
+panel_row <- function(title, cols) stat_row(title, rep("", length(cols)), cols)
+
+# Booktabs style: call AFTER all rows / header rows are added
+style_booktabs <- function(ft, caption, note, panel_i = NULL, rule_i = NULL, widths = NULL) {
+  thick <- fp_border(width = 1.5); thin <- fp_border(width = 0.75)
+  ft <- ft |>
+    border_remove() |>
+    hline_top(border = thick, part = "header") |>
+    hline_bottom(border = thin, part = "header") |>
+    hline_bottom(border = thick, part = "body") |>
+    font(fontname = "Times New Roman", part = "all") |>
+    fontsize(size = 10, part = "all") |>
+    align(align = "center", part = "all") |>
+    align(j = 1, align = "left", part = "all") |>
+    padding(padding.top = 0, padding.bottom = 0, part = "all") |>
+    line_spacing(space = 1, part = "all")
+  for (i in rule_i)  ft <- hline(ft, i = i, border = thin, part = "body")      # thin rule before the stats lines
+  for (i in panel_i) ft <- ft |> merge_at(i = i, j = 1:ncol_keys(ft), part = "body") |>
+                                  italic(i = i, part = "body")
+  ft |>
+    add_footer_lines(paste("Notes:", note)) |>
+    fontsize(size = 8, part = "footer") |>
+    align(align = "left", part = "footer") |>
+    set_caption(caption = caption) |>
+    autofit() -> ft
+  # Fixed column widths (in inches) for wide tables, so they fit the page (A4, 1-inch margins = 6.3 in)
+  if (!is.null(widths)) ft <- ft |> width(j = seq_along(widths), width = widths) |>
+                              set_table_properties(layout = "fixed")
+  ft
+}
+
+## ---------- Table 2 (5.1): descriptive statistics ----------
+
+desc_labels <- c(co2_transport_pc                = "CO₂ transport (t p.c.)",
+                 co2_building_pc                 = "CO₂ buildings (t p.c.)",
+                 urb_rate                        = lab3[["urb"]],
+                 population_largest_city_pct_urb = lab3[["prim"]],
+                 pop_over_1M_pct_urb             = lab3[["m1"]],
+                 ln_cons                         = "ln household consumption p.c.",
+                 ln_density                      = "ln population density")
+
+t_desc <- decomp |>
+  filter(variable %in% names(desc_labels)) |>
+  mutate(variable = factor(variable, levels = names(desc_labels))) |>
+  arrange(variable) |>
+  transmute(Variable       = desc_labels[as.character(variable)],
+            Mean           = mean,
+            `SD overall`   = sd_overall,
+            `SD between`   = sd_between,
+            `SD within`    = sd_within,
+            `SD within (two-way)` = sd_within_tw,
+            Min            = min,
+            Max            = max,
+            `Within share` = sprintf("%.1f%%", 100 * share_within))
+
+ft_desc <- flextable(t_desc) |>
+  colformat_double(digits = 2) |>
+  style_booktabs(
+    caption = "Table 2: Descriptive statistics and decomposition of variance",
+    widths = c(1.6, 0.48, 0.58, 0.6, 0.58, 0.68, 0.48, 0.48, 0.55),
+    note = paste("35 OECD countries, 2000–2019 (N = 700). SD between: standard deviation of country means;",
+                 "SD within: standard deviation of deviations from country means.",
+                 "SD within (two-way): standard deviation after removing country and year means, i.e. the",
+                 "variation used by the two-way FE model; used as the typical within-country change.",
+                 "Within share: within variance (one-way) as a share of total variance."))
+ft_desc
+
+## ---------- Table 3 (5.2): main results, two-way FE ----------
+
+m_main <- list(tr_fe = m_tr[["FE (country+year)"]], bu_fe = m_bu[["FE (country+year)"]])
+cols_main <- names(m_main)
+
+body_main <- reg_block(m_main, map(m_main, vc_cl), x_main, labels)
+
+t_main <- bind_rows(
+  body_main,
+  stat_row("Country and year fixed effects", c("Yes", "Yes"), cols_main),
+  stat_row("Observations", map_int(m_main, nobs), cols_main),
+  stat_row("Within R²", fmt_num(map_dbl(m_main, r2_of)), cols_main),
+  stat_row("Hausman test (FE vs RE), χ²",
+           c(fmt_chi(h_tr$statistic, h_tr$p.value), fmt_chi(h_bu$statistic, h_bu$p.value)), cols_main),
+  stat_row("Mundlak test (γ = 0), Wald χ²(5)",
+           c(fmt_chi(w_tr$Chisq[2], w_tr$`Pr(>Chisq)`[2]), fmt_chi(w_bu$Chisq[2], w_bu$`Pr(>Chisq)`[2])), cols_main)
+)
+
+ft_main <- flextable(t_main) |>
+  set_header_labels(values = list(Variable = "", tr_fe = "Transport", bu_fe = "Buildings")) |>
+  style_booktabs(
+    caption = "Table 3: Urban structure and sectoral CO₂ emissions: two-way fixed effects",
+    note = paste("Dependent variable: ln per capita CO₂ emissions of the sector.",
+                 "All models include country and year fixed effects.",
+                 "Standard errors clustered by country in parentheses.",
+                 "Within R² refers to the within-transformed regression.",
+                 sprintf("Mundlak test: robust Wald test that the country means are jointly zero (p = %s for transport, p = %s for buildings).",
+                         fmt_p(w_tr$`Pr(>Chisq)`[2]), fmt_p(w_bu$`Pr(>Chisq)`[2])),
+                 "Specification and diagnostic tests: Table 4; within/between comparison: Table 5;",
+                 "pooled OLS, random effects, one-way FE and Mundlak estimates: Appendix Tables A1–A2;",
+                 "robustness checks and placebo: Appendix Tables A3–A4.",
+                 STARS_NOTE),
+    rule_i = nrow(body_main),
+    widths = c(3, 1.5, 1.5))
+ft_main
+
+## ---------- Table 4 (5.3): specification and diagnostic tests ----------
+
+t_tests <- tibble(
+  Test = c("Hausman, classical (FE vs RE), χ²",
+           "Mundlak, robust Wald (γ = 0), χ²(5)",
+           "Wooldridge serial correlation, F",
+           "Pesaran CD cross-sectional dependence, z"),
+  H0   = c("RE consistent", "RE consistent", "No serial correlation", "No cross-sectional dependence"),
+  tr   = c(fmt_test(h_tr$statistic, h_tr$p.value),
+           fmt_test(w_tr$Chisq[2], w_tr$`Pr(>Chisq)`[2]),
+           fmt_test(d_tr$wool$statistic, d_tr$wool$p.value, 0),
+           fmt_test(d_tr$pes$statistic,  d_tr$pes$p.value, 2)),
+  bu   = c(fmt_test(h_bu$statistic, h_bu$p.value),
+           fmt_test(w_bu$Chisq[2], w_bu$`Pr(>Chisq)`[2]),
+           fmt_test(d_bu$wool$statistic, d_bu$wool$p.value, 0),
+           fmt_test(d_bu$pes$statistic,  d_bu$pes$p.value, 2))
+)
+
+ft_tests <- flextable(t_tests) |>
+  set_header_labels(values = list(Test = "Test", H0 = "Null hypothesis",
+                                  tr = "Transport", bu = "Buildings")) |>
+  style_booktabs(
+    caption = "Table 4: Specification and diagnostic tests",
+    widths  = c(2.4, 1.5, 1.2, 1.2),
+    note = paste("Hausman: classical test comparing two-way FE and RE; assumes homoskedastic, serially uncorrelated errors.",
+                 "Mundlak: Wald test that the country means are jointly zero, with SE clustered by country (robust Hausman).",
+                 "Critical values of χ²(5): 9.24 (10%), 11.07 (5%), 15.09 (1%).",
+                 "Wooldridge: test for serial correlation in one-way FE residuals.",
+                 "Pesaran CD: test for cross-sectional dependence in two-way FE residuals; z ~ N(0,1) under H0 (reject if |z| > 1.96 at 5%)."))
+ft_tests
+
+## ---------- Table 5 (5.4): within vs between vs gap (Mundlak) ----------
+# Three columns per sector: within = beta (equal to the two-way FE estimate),
+# between = beta + gamma, gap = gamma (coefficient on the country mean).
+
+wb_cols <- function(m) {
+  V <- vc_cl(m); cf <- coef(m)   # "cf", not "b": tibble() below creates a column named b
+  cell <- function(est, se) {
+    p <- 2 * pnorm(-abs(est / se))
+    c(paste0(fmt_num(est), star_of(p)), paste0("(", fmt_num(se), ")"))
+  }
+  map_dfr(x_main, function(x) {
+    mx <- paste0("m_", x)
+    w_cell <- cell(cf[[x]],             sqrt(V[x, x]))
+    b_cell <- cell(cf[[x]] + cf[[mx]],  sqrt(V[x, x] + V[mx, mx] + 2 * V[x, mx]))
+    g_cell <- cell(cf[[mx]],            sqrt(V[mx, mx]))
+    tibble(w = w_cell, b = b_cell, g = g_cell)
+  })
+}
+
+wb_tr <- wb_cols(m_tr[["Mundlak / CRE"]])
+wb_bu <- wb_cols(m_bu[["Mundlak / CRE"]])
+
+t_wb <- tibble(Variable = as.vector(rbind(unname(labels[x_main]), "")),
+               tr_w = wb_tr$w, tr_b = wb_tr$b, tr_g = wb_tr$g,
+               bu_w = wb_bu$w, bu_b = wb_bu$b, bu_g = wb_bu$g)
+
+ft_wb <- flextable(t_wb) |>
+  set_header_labels(values = list(Variable = "",
+                                  tr_w = "Within (β)", tr_b = "Between (β+γ)", tr_g = "Gap (γ)",
+                                  bu_w = "Within (β)", bu_b = "Between (β+γ)", bu_g = "Gap (γ)")) |>
+  add_header_row(values = c("", "Transport", "Buildings"), colwidths = c(1, 3, 3)) |>
+  style_booktabs(
+    caption = "Table 5: Within-country versus between-country associations (Mundlak model)",
+    note = paste("Correlated random effects (Mundlak) model with year effects and country means of all regressors.",
+                 "Within = β (equal to the two-way FE estimate); between = β + γ;",
+                 "gap = γ, the coefficient on the country mean: a significant γ means that the within and",
+                 "between associations differ. Joint test of γ = 0: Table 4.",
+                 "Standard errors clustered by country in parentheses.", STARS_NOTE),
+    widths = c(1.6, 0.75, 0.85, 0.7, 0.75, 0.85, 0.7)) |>
+  hline(i = 1, j = 2:7, border = fp_border(width = 0.75), part = "header")
+ft_wb
+
+## ---------- Appendix Tables A1–A2: all estimators ----------
+
+full_table <- function(m, caption) {
+  ms <- set_names(m, paste0("c", seq_along(m)))
+  cols <- names(ms)
+  keys <- c(x_main, paste0("m_", x_main))
+  body <- reg_block(ms, map(ms, vc_cl), keys, labels)
+  t <- bind_rows(
+    body,
+    stat_row("Country effects",    c("No", "Random", "Fixed", "Fixed", "Means"), cols),
+    stat_row("Year fixed effects", c("No", "Yes", "No", "Yes", "Yes"), cols),
+    stat_row("Observations",       map_int(ms, nobs), cols),
+    stat_row("R²",                 fmt_num(map_dbl(ms, r2_of)), cols)
+  )
+  flextable(t) |>
+    set_header_labels(values = list(Variable = "", c1 = "Pooled OLS", c2 = "RE", c3 = "FE (country)",
+                                    c4 = "Two-way FE", c5 = "Mundlak")) |>
+    add_header_row(values = c("", paste0("(", 1:5, ")")), colwidths = rep(1, 6)) |>
+    style_booktabs(
+      caption = caption,
+      note = paste("Dependent variable: ln per capita CO₂ emissions. Standard errors clustered by country in parentheses.",
+                   "Column (4) corresponds to Table 3.",
+                   "In column (5), the \"Mean\" rows are the coefficients on the country means (γ); the between effect is β + γ (Table 5).",
+                   "R² values are not comparable across estimators.", STARS_NOTE),
+      rule_i = nrow(body))
+}
+
+ft_A1 <- full_table(m_tr, "Table A1: Transport emissions, all estimators")
+ft_A2 <- full_table(m_bu, "Table A2: Building emissions, all estimators")
+
+## ---------- Appendix Table A3: robustness ----------
+
+key_main <- c(urb = "urb_rate", prim = "population_largest_city_pct_urb", m1 = "pop_over_1M_pct_urb")
+key_lag  <- c(urb = "lag_urb_rate", prim = "lag_population_largest_city_pct_urb", m1 = "lag_pop_over_1M_pct_urb")
+key_alt  <- c(urb = "urb_rate", prim = "population_largest_city_pct_urb", m1 = "urban_population_over_1M")
+key_ld   <- setNames(paste0("d_", key_main), names(key_main))
+term_map_rob <- list(key_main, key_main, key_lag, key_alt, key_main, key_ld)
+
+rob_cols <- names(r_tr)   # Baseline, Driscoll-Kraay SE, lagged, LAS as % of total pop., excl. 4 countries
+
+rob_panel <- function(r, ld, title) {
+  ms <- c(r[rob_cols], list(ld))
+  vs <- c(robust_vcov(r)[rob_cols], list(vcovHC(ld, type = "HC1")))
+  names(ms) <- names(vs) <- paste0("c", 1:6)
+  list(rows = bind_rows(panel_row(title, names(ms)),
+                        reg_block(ms, vs, names(lab3), lab3, term_map_rob)),
+       nobs = map_int(ms, nobs))
+}
+
+rA <- rob_panel(r_tr, m_ld[["Transport"]], "Panel A: Transport")
+rB <- rob_panel(r_bu, m_ld[["Buildings"]], "Panel B: Buildings")
+cols_rob <- paste0("c", 1:6)
+
+t_rob <- bind_rows(
+  rA$rows, rB$rows,
+  stat_row("Controls",            rep("Yes", 6), cols_rob),
+  stat_row("Country and year FE", c(rep("Yes", 5), "–"), cols_rob),
+  stat_row("Observations",        rA$nobs, cols_rob)
+)
+n_coef_rob <- nrow(rA$rows) + nrow(rB$rows)
+
+ft_rob <- flextable(t_rob) |>
+  set_header_labels(values = list(Variable = "", c1 = "Baseline", c2 = "Driscoll–Kraay SE",
+                                  c3 = "Lagged (t−1)", c4 = "LAS as % of total pop.",
+                                  c5 = "Excl. 4 countries", c6 = "Long differences")) |>
+  add_header_row(values = c("", paste0("(", 1:6, ")")), colwidths = rep(1, 7)) |>
+  style_booktabs(
+    caption = "Table A3: Robustness checks for the urban-structure coefficients",
+    widths = c(1.65, 0.72, 0.72, 0.72, 0.8, 0.72, 0.88),
+    note = paste("Dependent variable: ln per capita CO₂ emissions of the sector.",
+                 "Controls: ln household consumption p.c. and ln population density.",
+                 "(1) Two-way FE, SE clustered by country (as in Table 3).",
+                 "(2) Same model with Driscoll–Kraay SE (2 lags), which may understate uncertainty with T = 20.",
+                 "(3) Urban-structure variables lagged by one year; the year 2000 is lost (N = 665).",
+                 "(4) LAS measured as % of total population (original World Bank measure).",
+                 "(5) Excludes TUR, JPN, NLD and CRI (suspected changes in national urban definitions).",
+                 "(6) Long differences between 2000–02 and 2017–19 averages, one observation per country, HC1 robust SE.",
+                 STARS_NOTE),
+    panel_i = c(1, nrow(rA$rows) + 1),
+    rule_i  = c(nrow(rA$rows), n_coef_rob))
+ft_rob
+
+## ---------- Appendix Table A4: industry placebo ----------
+
+body_plac <- reg_block(m_plac, map(m_plac, vc_cl), x_main, labels)
+t_plac <- bind_rows(
+  body_plac,
+  stat_row("Country and year FE", rep("Yes", 3), names(m_plac)),
+  stat_row("Observations",        map_int(m_plac, nobs), names(m_plac)),
+  stat_row("R²",                  fmt_num(map_dbl(m_plac, r2_of)), names(m_plac))
+)
+ft_plac <- flextable(t_plac) |>
+  set_header_labels(values = list(Variable = "", c1 = "Transport", c2 = "Buildings", c3 = "Industry (placebo)")) |>
+  style_booktabs(
+    caption = "Table A4: Placebo test with industrial emissions",
+    note = paste("Two-way FE; dependent variables are ln per capita CO₂ emissions of each sector.",
+                 "The transport and buildings columns are the main estimates of Table 3.",
+                 "Industrial combustion is a placebo outcome with no direct link to urban structure.",
+                 "Standard errors clustered by country in parentheses.", STARS_NOTE),
+    rule_i = nrow(body_plac))
+ft_plac
+
+## ---------- Export: one .docx per table ----------
+
+thesis_tables <- list(table2_descriptives      = ft_desc,
+                      table3_main_results      = ft_main,
+                      table4_tests             = ft_tests,
+                      table5_within_between    = ft_wb,
+                      tableA1_transport_all    = ft_A1,
+                      tableA2_buildings_all    = ft_A2,
+                      tableA3_robustness       = ft_rob,
+                      tableA4_placebo          = ft_plac)
+
+iwalk(thesis_tables, ~ save_as_docx(.x, path = out_thesis(paste0(.y, ".docx"))))
+```
